@@ -649,6 +649,26 @@ function avatarUrl(hash) {
   return hash ? `https://tr.rbxcdn.com/30DAY-Avatar-${hash}-Png/420/420/Avatar/Png/noFilter` : null;
 }
 
+// Parses the optional value tag at the end of a user row, e.g. "w:5842.00" (wallet/
+// account, an estimate) or "i:230.48" (inventory). Returns { type, val }; type is
+// null when there's no value.
+function parseUsd(raw) {
+  if (typeof raw !== 'string') return { type: null, val: 0 };
+  const m = /^([wi]):([\d.]+)$/.exec(raw);
+  if (!m) return { type: null, val: 0 };
+  return { type: m[1], val: parseFloat(m[2]) || 0 };
+}
+
+// $152 (<1k, no decimals), $5.8K, $253K, $1.2M. "w" values are estimates, shown ~$…+.
+function fmtUsd(type, val) {
+  let s;
+  if (val >= 1e9)      s = '$' + (val / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+  else if (val >= 1e6) s = '$' + (val / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+  else if (val >= 1e3) s = '$' + (val / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+  else                 s = '$' + Math.round(val);
+  return type === 'w' ? '~' + s + '+' : s;
+}
+
 const PAGE_SIZE = 40;
 const NOW = Date.now();
 
@@ -693,6 +713,15 @@ function matchRank(u, q) {
   return -1;
 }
 
+// Length of the field that matched q, so the shortest match within a relevance
+// bucket sorts first (e.g. "da" → "dai" before "david"). Mirrors matchRank's
+// ogu / username / id field ordering.
+function matchLen(u, r) {
+  return (r === 2 || r === 3 || r === 7) ? (u.username || u.ogu).length
+       : (r === 4 || r === 5 || r === 8) ? String(u.id).length
+       : (u.ogu || u.username).length;
+}
+
 function sortCmp(a, b) {
   if (sort.key === 'alpha') {
     return sort.dir * (a.username || '').localeCompare(b.username || '', undefined, { sensitivity: 'base' });
@@ -715,7 +744,7 @@ function relativeAge(created) {
   return Math.floor(months / 12) + 'y';
 }
 
-function buildCard(user) {
+function buildCard(user, opts) {
   const a = document.createElement('a');
   a.className = 'card';
   a.href = `https://www.roblox.com/users/${user.id}/profile`;
@@ -739,7 +768,8 @@ function buildCard(user) {
     tag.className = 'card-banned-tag';
     tag.textContent = 'Banned';
     a.appendChild(tag);
-  } else if (!user.valid) {
+  } else if (!user.valid && !(opts && opts.usd)) {
+    // USD tab shows inactive accounts as normal cards (no greyed-out treatment).
     a.classList.add('inactive');
     const tag = document.createElement('span');
     tag.className = 'card-inactive-tag';
@@ -800,6 +830,13 @@ function buildCard(user) {
   footer.appendChild(usernameEl);
   footer.appendChild(age);
 
+  if (opts && opts.usd && user.usdType) {
+    const usd = document.createElement('div');
+    usd.className = 'card-usd';
+    usd.textContent = fmtUsd(user.usdType, user.usdVal);
+    usd.title = user.usdType === 'w' ? 'Estimated account value' : 'Inventory value';
+    body.appendChild(usd);
+  }
   body.appendChild(displayRow);
   body.appendChild(footer);
 
@@ -869,6 +906,7 @@ function scheduleScrollCheck() {
   scrollScheduled = true;
   requestAnimationFrame(function run() {
     scrollScheduled = false;
+    if (document.getElementById('view-roblox').hidden) return;
     if (rendered >= filtered.length) return;
     if (sentinel.getBoundingClientRect().top < window.innerHeight + 600) {
       renderMore();
@@ -1013,6 +1051,30 @@ scopeMenu.addEventListener('click', e => {
 document.addEventListener('click', e => { if (!scopeDD.contains(e.target)) closeScopeMenu(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeScopeMenu(); });
 
+// Reset the Users tab. Switching tabs clears just the search and filters; an
+// explicit refresh (re-clicking the active tab or clicking the title) passes
+// full=true to also reset the sort and scope. Either way: rebuild, scroll to top.
+function resetRoblox(full) {
+  searchEl.value = '';
+  filters.verifiedOnly = filters.showAlts = filters.showBanned = false;
+  filters.lenMax = 0;
+  lengthIndex = 0;
+  if (full) {
+    sortIndex = 0;
+    searchSortOverride = false;
+    sort.key = SORT_CYCLE[0].key;
+    sort.dir = SORT_CYCLE[0].dir;
+    sortLabel.textContent = SORT_CYCLE[0].label;
+    sortArrow.textContent = SORT_CYCLE[0].arrow;
+    scope = 'ogu';
+    updateScopeUI();
+  }
+  syncFilterUI();
+  updateSearchUI();
+  applySearch();
+  window.scrollTo({ top: 0 });
+}
+
 function recomputeStats() {
   const total  = allUsers.length;
   const banned = allUsers.filter(u => u.banned).length;
@@ -1039,14 +1101,22 @@ clearBtn.addEventListener('click', () => {
 });
 
 document.addEventListener('keydown', (e) => {
+  const usdSearch = document.getElementById('usd-search');
+  const usdVisible = !document.getElementById('view-usd').hidden && usdSearch;
+  const robloxVisible = !document.getElementById('view-roblox').hidden;
+  // Search box for the visible tab, or null when the current tab has none (Games).
+  const activeSearch = usdVisible ? usdSearch : (robloxVisible ? searchEl : null);
   const typing = document.activeElement === searchEl;
-  if (e.key === '/' && !typing) {
+  const typingAny = typing || document.activeElement === usdSearch;
+  if (e.key === '/' && !typingAny) {
+    if (!activeSearch) return;
     e.preventDefault();
-    searchEl.focus();
+    activeSearch.focus();
   } else if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
+    if (!activeSearch) return;
     e.preventDefault();
-    searchEl.focus();
-    searchEl.select();
+    activeSearch.focus();
+    activeSearch.select();
   } else if (e.key === 'Enter' && typing) {
     e.preventDefault();
     clearTimeout(searchTimeout);
@@ -1118,20 +1188,194 @@ document.addEventListener('keydown', (e) => {
   });
 })();
 
+// The USD tab: every user carrying a value tag, sorted high → low, with search.
+// Reuses buildCard()/matchRank() from the main directory; no filters by design.
+const UsdTab = (function () {
+  let gridEl, sentinelEl, countEl, searchEl, searchWrap, clearBtn, bannedBtn;
+  let pool = [];   // users with a value, sorted high → low (built once data lands)
+  let view = [];   // current search result
+  let rendered = 0;
+  let wired = false;
+  let ready = false;
+  let showBanned = false;   // inactive users always show; banned are opt-in
+  let searchTimeout = null;
+  let scrollScheduled = false;
+
+  const isHidden = () => { const v = document.getElementById('view-usd'); return !v || v.hidden; };
+
+  function filterPool() {
+    const base = showBanned ? pool : pool.filter(u => !u.banned);
+    const q = searchEl.value.trim().toLowerCase();
+    if (!q) return base;
+    // Bucket by relevance like the main directory, then within each bucket put the
+    // shortest matching name first ("da" → "dai" before "david"), ties broken by
+    // value (base is already sorted high → low).
+    const buckets = [[], [], [], [], [], [], [], [], []];
+    for (const u of base) {
+      const r = matchRank(u, q);
+      if (r >= 0) buckets[r].push(u);
+    }
+    const out = [];
+    buckets.forEach((b, r) => {
+      b.sort((a, c) => matchLen(a, r) - matchLen(c, r) || c.usdVal - a.usdVal);
+      out.push(...b);
+    });
+    return out;
+  }
+
+  function renderMore() {
+    if (rendered >= view.length) return;
+    const frag = document.createDocumentFragment();
+    const end = Math.min(rendered + PAGE_SIZE, view.length);
+    for (let i = rendered; i < end; i++) {
+      const card = buildCard(view[i], { usd: true });
+      card.style.animationDelay = Math.min((i - rendered) * 22, 180) + 'ms';
+      frag.appendChild(card);
+    }
+    rendered = end;
+    gridEl.appendChild(frag);
+  }
+
+  function scheduleScroll() {
+    if (scrollScheduled) return;
+    scrollScheduled = true;
+    requestAnimationFrame(function run() {
+      scrollScheduled = false;
+      if (isHidden() || rendered >= view.length) return;
+      if (sentinelEl.getBoundingClientRect().top < window.innerHeight + 600) {
+        renderMore();
+        if (rendered < view.length &&
+            sentinelEl.getBoundingClientRect().top < window.innerHeight + 600) {
+          scrollScheduled = true;
+          requestAnimationFrame(run);
+        }
+      }
+    });
+  }
+
+  function build() {
+    if (!wired) return;
+    view = filterPool();
+    gridEl.innerHTML = '';
+    rendered = 0;
+    if (view.length === 0) {
+      const nr = document.createElement('div');
+      nr.className = 'no-results';
+      const q = searchEl.value.trim();
+      if (q) {
+        nr.append('No matches for ');
+        const strong = document.createElement('strong');
+        strong.textContent = '“' + q + '”';
+        nr.append(strong, '.');
+      } else {
+        nr.textContent = ready ? 'No users have a USD value yet.' : 'Loading…';
+      }
+      gridEl.appendChild(nr);
+      countEl.textContent = ready ? '0 users' : '';
+      return;
+    }
+    countEl.textContent = view.length === 1 ? '1 user' : view.length.toLocaleString() + ' users';
+    renderMore();
+    scheduleScroll();
+  }
+
+  function updateSearchUI() {
+    searchWrap.classList.toggle('has-value', searchEl.value.length > 0);
+  }
+
+  // Called once the directory data has finished loading.
+  function setData() {
+    pool = allUsers.filter(u => u.usdType).sort((a, b) => b.usdVal - a.usdVal);
+    ready = true;
+    if (wired && !isHidden()) build();
+  }
+
+  // Called every time the USD tab is shown; wires the DOM on first use.
+  function init() {
+    if (!wired) {
+      gridEl     = document.getElementById('usd-grid');
+      sentinelEl = document.getElementById('usd-sentinel');
+      countEl    = document.getElementById('usd-count');
+      searchEl   = document.getElementById('usd-search');
+      searchWrap = document.getElementById('usd-search-wrap');
+      clearBtn   = document.getElementById('usd-search-clear');
+      bannedBtn  = document.getElementById('usd-btn-banned');
+      wired = true;
+
+      bannedBtn.addEventListener('click', () => {
+        showBanned = !showBanned;
+        bannedBtn.classList.toggle('active', showBanned);
+        bannedBtn.setAttribute('aria-pressed', showBanned);
+        build();
+      });
+      searchEl.addEventListener('input', () => {
+        updateSearchUI();
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(build, 150);
+      });
+      clearBtn.addEventListener('click', () => {
+        searchEl.value = '';
+        updateSearchUI();
+        build();
+        searchEl.focus();
+      });
+      searchEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          clearTimeout(searchTimeout);
+          build();
+          searchEl.blur();
+        } else if (e.key === 'Escape') {
+          if (searchEl.value) { searchEl.value = ''; updateSearchUI(); build(); }
+          else searchEl.blur();
+        }
+      });
+      window.addEventListener('scroll', scheduleScroll, { passive: true });
+      window.addEventListener('resize', scheduleScroll, { passive: true });
+    }
+    build();
+  }
+
+  // Re-clicking the USD tab resets it: clear the search and the banned toggle,
+  // rebuild the list, and jump back to the top.
+  function reset() {
+    if (!wired) return;
+    searchEl.value = '';
+    showBanned = false;
+    bannedBtn.classList.remove('active');
+    bannedBtn.setAttribute('aria-pressed', 'false');
+    updateSearchUI();
+    build();
+    window.scrollTo({ top: 0 });
+  }
+
+  return { init, setData, reset };
+})();
+
 (function () {
   const tabs = document.querySelectorAll('#tabs .tab');
   const tip = document.getElementById('tab-tooltip');
   const hero = document.querySelector('.hero');
   const heroTitleMain = document.getElementById('hero-title-main');
   const heroTitleGames = document.getElementById('hero-title-games');
+  const heroTitleUsd = document.getElementById('hero-title-usd');
   const heroDesc = document.getElementById('hero-desc');
   const heroStats = document.getElementById('hero-stats');
   const viewRoblox = document.getElementById('view-roblox');
   const viewGames = document.getElementById('view-games');
+  const viewUsd = document.getElementById('view-usd');
 
   const HERO_DESC = {
     roblox: 'A directory of OGU Roblox accounts — short, rare, and original usernames.',
     games:  'Your favorite games — gathered in one place.',
+    usd:    'Accounts ranked by inventory value.',
+  };
+
+  // name → { view element, hero title element, url path, compact hero, show stat pills }
+  const VIEWS = {
+    roblox: { view: viewRoblox, title: heroTitleMain,  path: '/',      compact: false, stats: true,  doc: 'Users' },
+    games:  { view: viewGames,  title: heroTitleGames, path: '/games', compact: true,  stats: false, doc: 'Games' },
+    usd:    { view: viewUsd,    title: heroTitleUsd,   path: '/usd',   compact: true,  stats: false, doc: 'USD'   },
   };
 
   let gamesInjected = false, gamesInjecting = false;
@@ -1139,7 +1383,7 @@ document.addEventListener('keydown', (e) => {
     if (gamesInjected || gamesInjecting) return;
     gamesInjecting = true;
     try {
-      const res = await fetch('./games.html');
+      const res = await fetch('./games.html', { cache: 'no-cache' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       viewGames.innerHTML = await res.text();
       gamesInjected = true;
@@ -1148,6 +1392,26 @@ document.addEventListener('keydown', (e) => {
       viewGames.innerHTML = '<div class="games-error">Couldn\'t load the games view. Please try again.</div>';
     } finally {
       gamesInjecting = false;
+    }
+  }
+
+  // USD view lives in usd.html (same pattern as games). Fetch+inject once, then
+  // (re)build on every activation — UsdTab.init() only wires the DOM on first run.
+  let usdInjected = false, usdInjecting = false;
+  async function ensureUsdView() {
+    if (usdInjected) { UsdTab.init(); return; }
+    if (usdInjecting) return;
+    usdInjecting = true;
+    try {
+      const res = await fetch('./usd.html', { cache: 'no-cache' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      viewUsd.innerHTML = await res.text();
+      usdInjected = true;
+      UsdTab.init();
+    } catch (e) {
+      viewUsd.innerHTML = '<div class="games-error">Couldn\'t load the USD view. Please try again.</div>';
+    } finally {
+      usdInjecting = false;
     }
   }
 
@@ -1161,7 +1425,11 @@ document.addEventListener('keydown', (e) => {
   function hideTip() { tip.classList.remove('show'); }
 
   function activate(name, push) {
-    const isGames = name === 'games';
+    if (!VIEWS[name]) name = 'roblox';
+    const cfg = VIEWS[name];
+    // Keep html[data-tab] in sync so the pre-paint anti-flash CSS matches the
+    // current tab after client-side switches too (not just the initial load).
+    document.documentElement.dataset.tab = name;
 
     document.querySelectorAll('.modal-overlay').forEach(m => { m.hidden = true; });
     document.body.style.overflow = '';
@@ -1169,19 +1437,25 @@ document.addEventListener('keydown', (e) => {
       document.activeElement.blur();
     }
     tabs.forEach(t => t.classList.toggle('active', !t.dataset.tip && t.dataset.tab === name));
-    viewRoblox.hidden = isGames;
-    viewGames.hidden = !isGames;
-    heroStats.hidden = isGames;
 
-    hero.classList.toggle('compact', isGames);
-    heroTitleMain.hidden = isGames;
-    heroTitleGames.hidden = !isGames;
+    for (const key in VIEWS) {
+      VIEWS[key].view.hidden = key !== name;
+      VIEWS[key].title.hidden = key !== name;
+    }
+    heroStats.hidden = !cfg.stats;
+    hero.classList.toggle('compact', cfg.compact);
     heroDesc.textContent = HERO_DESC[name] || HERO_DESC.roblox;
-    document.title = (isGames ? 'Games' : 'Users') + ' | OGUs.gg';
-    if (isGames) ensureGamesView();
+    document.title = cfg.doc + ' | OGUs.gg';
+
+    // Render the main grid on activation. Needed when the page was first loaded
+    // on /games or /usd (roblox view hidden): the data-load render bails while
+    // hidden, so the grid would otherwise stay empty until a filter/search runs.
+    if (name === 'roblox') scheduleScrollCheck();
+    if (name === 'games') ensureGamesView();
+    if (name === 'usd') ensureUsdView();
 
     if (push) {
-      try { history.pushState({ tab: name }, '', (isGames ? '/games' : '/') + location.search); } catch (_) {}
+      try { history.pushState({ tab: name }, '', cfg.path + location.search); } catch (_) {}
     }
   }
 
@@ -1192,13 +1466,32 @@ document.addEventListener('keydown', (e) => {
       t.addEventListener('mouseenter', () => showTip(t));
       t.addEventListener('mouseleave', hideTip);
     } else {
-      t.addEventListener('click', () => activate(t.dataset.tab, true));
+      t.addEventListener('click', () => {
+        const name = t.dataset.tab;
+        const switching = document.documentElement.dataset.tab !== name;
+        if (switching) activate(name, true);
+        // Switching clears the destination tab's search + filters; re-clicking
+        // the active tab is a full refresh (also resets its sort + scope).
+        resetTab(name, !switching);
+      });
     }
+  });
+
+  function resetTab(name, full) {
+    if (name === 'roblox') resetRoblox(full);
+    else if (name === 'usd') UsdTab.reset();
+    else window.scrollTo({ top: 0 });
+  }
+
+  // Clicking a hero title (OGUs.gg / USD / Games) refreshes the active tab — the
+  // same full reset as clicking its tab button again.
+  document.querySelectorAll('.hero-title').forEach(h => {
+    h.addEventListener('click', () => resetTab(document.documentElement.dataset.tab, true));
   });
 
   document.querySelector('.tabs-wrap').addEventListener('scroll', hideTip, { passive: true });
 
-  const tabForPath = p => /\/games\/?$/.test(p) ? 'games' : 'roblox';
+  const tabForPath = p => /\/games\/?$/.test(p) ? 'games' : /\/usd\/?$/.test(p) ? 'usd' : 'roblox';
 
   activate(tabForPath(location.pathname), false);
   window.addEventListener('popstate', () => activate(tabForPath(location.pathname), false));
@@ -1225,10 +1518,6 @@ function applySearch() {
     // Default: within each relevance bucket, shortest matching name first (e.g.
     // "demoni" → "demonic" before "demonizing"), ties broken by the active sort.
     // Once the user presses the sort toggle during a search, that sort takes over.
-    const matchLen = (u, r) =>
-      (r === 2 || r === 3 || r === 7) ? (u.username || u.ogu).length
-      : (r === 4 || r === 5 || r === 8) ? String(u.id).length
-      : (u.ogu || u.username).length;
     filtered = [];
     buckets.forEach((b, r) => {
       if (!b.length) return;
@@ -1397,18 +1686,23 @@ showSkeletons(28);
     const data = JSON.parse(text);
 
     allUsers = Object.entries(data)
-      .map(([id, a]) => ({
-        id,
-        ogu:      a[0],
-        username: a[1] || a[0],
-        display:  a[2] || a[1] || a[0],
-        created:  a[3] ? a[3] * 1000 : null,
-        banned:   a[4],
-        verified: a[5],
-        avatar:   avatarUrl(a[6]),
-        valid:    a[7],
-        isOgu:    a[8] === 0,
-      }))
+      .map(([id, a]) => {
+        const usd = parseUsd(a[9]);
+        return {
+          id,
+          ogu:      a[0],
+          username: a[1] || a[0],
+          display:  a[2] || a[1] || a[0],
+          created:  a[3] ? a[3] * 1000 : null,
+          banned:   a[4],
+          verified: a[5],
+          avatar:   avatarUrl(a[6]),
+          valid:    a[7],
+          isOgu:    a[8] === 0,
+          usdType:  usd.type,
+          usdVal:   usd.val,
+        };
+      })
       .sort((a, b) => Number(a.id) - Number(b.id));
 
     scopeCounts = { ogu: allUsers.filter(u => u.isOgu).length, all: allUsers.length };
@@ -1418,6 +1712,7 @@ showSkeletons(28);
     grid.innerHTML = '';
     hideProgress();
     applySearch();
+    UsdTab.setData();
   } catch (e) {
     if (fakeTimer) clearInterval(fakeTimer);
     hideProgress();
